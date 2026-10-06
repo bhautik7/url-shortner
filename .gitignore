@@ -1,51 +1,45 @@
-# ---- secrets / local config ----
-.env
-.env.local
-*.env
-!.env.example
-appsettings.Local.json
-
-# ---- .NET ----
-bin/
-obj/
-[Dd]ebug/
-[Rr]elease/
-*.user
-*.suo
-.vs/
-.vscode/
-.idea/
-.claude/
-TestResults/
-
-# ---- Node ----
-node_modules/
-dist/
-.vite/
-*.tsbuildinfo
-npm-debug.log*
-
-# ---- Python ----
+# Python
 __pycache__/
 *.py[cod]
-.venv/
+*$py.class
+*.so
+.Python
+env/
 venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
 .pytest_cache/
-.ruff_cache/
-.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
 
-# ---- OS / editors ----
-.DS_Store
-Thumbs.db
+# Environment
+.env
+.env.local
 
-# ---- docker volumes / local data ----
-infrastructure/docker/data/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Kept on disk, deliberately never committed.
-#
-# The handoff is the working record of this project: what is half-built, which
-# credentials have been mishandled, what is known to be weak and has not been
-# fixed yet. That is exactly what a maintainer needs and exactly what should
-# not be sitting in a repository's history, where deleting it later does not
-# remove it.
-docs/PROJECT_HANDOFF.md
+# Docker / DB data
+pg_data/
+redis_data/

@@ -1,184 +1,309 @@
-# IncidentIQ
+# Production-Grade Scalable URL Shortener
 
-Groups repeated application errors into incidents and explains them.
+A high-performance, distributed URL Shortener application designed for extreme read-heavy workloads ($\approx 1000:1$ read/write ratio), sub-millisecond redirect latency, and fault-tolerant horizontal scalability.
 
-Paste a log at http://localhost:3000 and you get back one incident with an
-occurrence count, the error pattern behind it, any release that lines up in
-time, similar past incidents, and a written probable cause. A burst of 4,200
-near-identical lines produces one incident, not 4,200.
+---
 
-## Quick start
+## 📖 System Architecture & Overview
+
+The system decouples read and write concerns into independently scalable microservices, shielded by an Nginx API Gateway, utilizing Redis for both in-memory cache-aside redirection and atomic batch counter leasing, with PostgreSQL as the persistent source of truth.
+
+```
+                               ┌───────────────────────────┐
+                               │       Client / Browser    │
+                               └─────────────┬─────────────┘
+                                             │ HTTP
+                                             ▼
+                               ┌───────────────────────────┐
+                               │    Nginx API Gateway      │
+                               │        (Port 80)          │
+                               └───┬───────────────────┬───┘
+               POST /api/v1/urls   │                   │   GET /{short_code}
+                                   ▼                   ▼
+                     ┌───────────────────┐       ┌───────────────────┐
+                     │   Write Service   │       │   Read Service    │
+                     │  (Port 8001/80)   │       │  (Port 8002/80)   │
+                     └───┬───────────┬───┘       └───┬───────────┬───┘
+                         │           │               │           │
+           Lease Range   │           │               │ Cache HIT │ Cache MISS
+         (INCRBY batch)  │           │               ▼           │
+                         │           │       ┌───────────────┐   │
+                         │           └──────►│  Redis Cache  │◄──┘ (Populate)
+                         │                   └───────────────┘
+                         ▼                           │
+                 ┌───────────────┐                   │
+                 │ Redis Counter │                   │
+                 └───────────────┘                   │
+                         │                           ▼
+                         └──────────────────►┌───────────────┐
+                                             │  PostgreSQL   │
+                                             │ (Primary DB)  │
+                                             └───────────────┘
+```
+
+---
+
+## ⚡ Data Flow Pipelines
+
+### 1. Write Flow (URL Creation & Short Code Allocation)
+
+```
+Client
+  │
+  │  POST /api/v1/urls {"long_url": "https://...", "custom_alias": "..."}
+  ▼
+Nginx Gateway
+  │
+  ▼
+Write Service (FastAPI)
+  │
+  ├─► [1] Rate Limiter (Redis fixed window per client IP)
+  │
+  ├─► [2] Custom Alias Check?
+  │        ├─► YES: Validate format & check collision in PostgreSQL
+  │        └─► NO:  Get next ID from in-memory leased batch
+  │                 (If batch exhausted, lease next 1000 IDs via Redis INCRBY)
+  │
+  ├─► [3] Base62 Encoder (Deterministic integer -> alphanumeric Base62)
+  │
+  ├─► [4] PostgreSQL INSERT (Enforces UNIQUE constraint & rolls back on conflict)
+  │
+  ▼
+HTTP 201 Created {"short_code": "4C92x", "short_url": "http://localhost/4C92x"}
+```
+
+---
+
+### 2. Read Flow (High-Speed Redirect & Cache-Aside)
+
+```
+Client
+  │
+  │  GET /4C92x
+  ▼
+Nginx Gateway
+  │
+  ▼
+Read Service (FastAPI)
+  │
+  ▼
+Redis Cache (Cache-Aside lookup: key="url:4C92x")
+  │
+  ├───► [CACHE HIT] ──► Validate expiration ──► Return HTTP 302 Found (Sub-millisecond)
+  │
+  └───► [CACHE MISS / Redis Unavailable]
+           │
+           ▼
+        PostgreSQL (B-Tree index lookup: WHERE short_code = '4C92x')
+           │
+           ├───► [NOT FOUND] ───────────────► Return HTTP 404 Not Found
+           ├───► [EXPIRED (now >= expires)] ─► Return HTTP 410 Gone
+           └───► [ACTIVE URL]
+                    │
+                    ├─► Compute intelligent TTL (min(remaining_seconds, max_ttl))
+                    ├─► Asynchronously populate Redis cache
+                    └─► Return HTTP 302 Found
+```
+
+---
+
+## 🔬 Core Engineering Decisions Explained
+
+### 1. Why Redis for Caching & Counters?
+- **Caching:** Redis stores frequently accessed mappings in RAM, offloading 99.9% of read traffic from disk-backed PostgreSQL and ensuring sub-millisecond response times.
+- **Atomic Counter:** Redis single-threaded execution guarantees atomic `INCRBY` operations without distributed database row locks or race conditions.
+
+### 2. Cache-Aside Pattern
+- The application code manages the cache directly. On reads, the cache is consulted first; on a miss, the database is queried, and the result is backfilled into Redis with an intelligent TTL.
+
+### 3. Database Indexing
+- `short_code` (Unique B-Tree): Enables $O(\log N)$ point lookups on cache misses and prevents race conditions on duplicate custom aliases.
+- `expires_at` (B-Tree): Optimizes garbage collection queries (`WHERE expires_at <= NOW()`) for background workers without table scans.
+
+### 4. Base62 Encoding
+- Positional numeral system using characters `[0-9a-zA-Z]`.
+- Bijective and collision-free: every integer maps to exactly one alphanumeric code.
+- 6 characters provide $62^6 \approx 56.8\text{ Billion}$ unique short codes.
+
+### 5. Why HTTP 302 Found instead of 301 Moved Permanently?
+- **HTTP 301:** Permanently cached by client browsers. Expired links or updated targets cannot be revoked, and click tracking metrics are bypassed.
+- **HTTP 302:** Directs browsers to follow the redirect without storing an immutable local cache, ensuring link expiration enforcement and real-time observability.
+
+### 6. Counter Batching
+- Each Write Service instance leases a block of 1,000 IDs at a time via `INCRBY`.
+- Dispenses numbers locally under an async lock in $O(1)$ time, eliminating 99.9% of Redis round-trips during writes.
+
+### 7. Read / Write Separation
+- Extreme traffic skew ($\approx 1000:1$) allows the Read Service to scale horizontally to 50+ pods, while the Write Service remains lean at 2–3 pods. Failure in write paths does not impact redirection uptime.
+
+---
+
+## 🚀 Quick Start (Docker Compose)
+
+The entire system runs out-of-the-box with Docker and Docker Compose.
 
 ```bash
-cp infrastructure/docker/.env.example infrastructure/docker/.env
+# 1. Clone repository and start Docker Compose
+git clone <repo-url>
+cd quick-babbage
+
+# 2. Build and start all services in background
 make up
-make health
+
+# 3. View logs across all services
+make logs
 ```
 
-Open http://localhost:3000 and paste a log into the box.
+Verify services are healthy:
+```bash
+curl -i http://localhost/health
+curl -i http://localhost/ready
+```
 
-Or drive it from the shell:
+---
+
+## 🛠️ API Usage Examples
+
+### 1. Create Short URL (Auto-Generated Base62)
+```bash
+curl -X POST http://localhost/api/v1/urls \
+  -H "Content-Type: application/json" \
+  -d '{
+    "long_url": "https://fastapi.tiangolo.com/tutorial/"
+  }'
+```
+**Response (HTTP 201 Created):**
+```json
+{
+  "short_code": "4C92x",
+  "short_url": "http://localhost/4C92x",
+  "long_url": "https://fastapi.tiangolo.com/tutorial/",
+  "expiration_date": null
+}
+```
+
+### 2. Create Short URL with Custom Alias & Expiration
+```bash
+curl -X POST http://localhost/api/v1/urls \
+  -H "Content-Type: application/json" \
+  -d '{
+    "long_url": "https://github.com/fastapi/fastapi",
+    "custom_alias": "fastapi-docs",
+    "expiration_date": "2026-12-31T23:59:59Z"
+  }'
+```
+
+### 3. Test Redirection (HTTP 302)
+```bash
+curl -i http://localhost/4C92x
+```
+**Response Header:**
+```http
+HTTP/1.1 302 Found
+Location: https://fastapi.tiangolo.com/tutorial/
+X-Request-ID: c5a9a832-6a68-450f-a39c-36ecfb6a86fe
+```
+
+### 4. Duplicate Custom Alias Error (HTTP 409)
+```bash
+curl -X POST http://localhost/api/v1/urls \
+  -H "Content-Type: application/json" \
+  -d '{
+    "long_url": "https://example.com/another",
+    "custom_alias": "fastapi-docs"
+  }'
+```
+**Response (HTTP 409 Conflict):**
+```json
+{
+  "error": {
+    "code": "ALIAS_ALREADY_EXISTS",
+    "message": "The requested alias is already in use."
+  }
+}
+```
+
+---
+
+## 🧪 Testing
 
 ```bash
-./scripts/send-logs.sh --count 60                        # synthetic burst
-./scripts/upload-log.py samples/payments-api.log --replay-as-now --watch
-./scripts/show-analysis.sh --watch                       # patterns -> incidents -> analysis
-./scripts/show-analysis.sh --reset                       # clear pipeline data, keep services
-./scripts/record-deployment.sh -s payments-api -v 2.8.4  # tell it a release shipped
+# Run all unit and integration tests
+make test
+
+# Run unit tests only
+make test-unit
+
+# Run integration tests only
+make test-integration
 ```
 
-## Ports
+---
 
-The dashboard is the only one you need. It proxies the API, the realtime hub
-and ingestion, so the browser talks to port 3000 and holds no credential. The
-rest are published for the scripts and for debugging.
+## 📊 Load Testing
 
-| | URL | Credentials |
-|---|---|---|
-| Dashboard | http://localhost:3000 | none |
-| Query API | http://localhost:5080 | `X-Api-Key`, see `.env` |
-| Ingestion | http://localhost:5081 | `X-Api-Key`, see `.env` |
-| Event processor | http://localhost:5082 | health and metrics only |
-| AI worker (`/docs`) | http://localhost:5083 | health and metrics only |
-| Prometheus | http://localhost:9090 | none |
-| Grafana | http://localhost:3001 | `.env` |
-| MinIO console | http://localhost:9001 | `.env` |
-| PostgreSQL | `localhost:5433` | `.env` |
-| Kafka | `localhost:29092` | none, PLAINTEXT, local only |
-| Redis | `localhost:6380` | `.env` |
-
-Redis and MinIO run but no application code uses them yet.
-[ADR 0006](docs/adr/0006-defer-redis-and-object-storage.md) records what would
-have to be true before either is adopted.
-
-`make help` lists every target.
-
-## How it works
-
-```
-HTTP -> Kafka -> normalise + fingerprint -> detection rules -> incident
-     -> outbox -> Python worker -> embedding -> pgvector -> LLM -> API -> React
-```
-
-Ingestion validates a batch, writes it to Kafka and returns 202 without
-touching the database. The event processor consumes `logs.raw`, masks the
-variable parts of each message (`user 18273` becomes `user {NUM}`), hashes the
-result into a fingerprint, and counts occurrences per fingerprint per minute.
-Four rules decide when that is worth an incident.
-
-Opening an incident writes an outbox row in the same transaction, so a broker
-that is down delays the announcement rather than losing it. The Python worker
-picks it up, embeds the pattern, searches pgvector for similar past incidents,
-and asks Claude for a probable cause. Raw log lines are never sent to the
-model; a redaction scanner runs before every call and aborts it on a hit.
-
-Decisions and their reasoning live in [docs/adr/](docs/adr/) - 17 records, and
-the real documentation. Start with
-[0012](docs/adr/0012-log-fingerprinting.md) on fingerprinting and
-[0016](docs/adr/0016-evidence-before-llm.md) on why retrieval does the work and
-the model only writes the paragraph.
-
-## Layout
-
-```
-apps/web/                React 19, TypeScript, Vite, Tailwind. nginx in the container.
-services/
-  api/                   Query API, incident actions, SignalR hub
-  ingestion/             POST /api/v1/logs/batch -> Kafka
-  event-processor/       Normalise, fingerprint, detect
-  incidents/             Lifecycle rules, shared by the API and the detector
-  outbox/                Transactional outbox publisher
-  domain/                Entities and enums, no EF dependency
-  persistence/           DbContext, EF configs, migrations
-  contracts/             Kafka wire types
-  messaging/             Producer and consumer abstractions
-  shared/                Logging, health, metrics, API key auth
-workers/ai-analysis/     Python 3.12, FastAPI, sentence-transformers, Anthropic
-infrastructure/docker/   docker-compose.yml, .env.example
-tests/                   6 .NET test projects
-tools/load-generator/    k6 scripts
-```
-
-## Tests
-
+Run Locust headless benchmark:
 ```bash
-make verify                                          # build + test + web build
-dotnet test IncidentIQ.slnx
-cd workers/ai-analysis && .venv/bin/python -m pytest -q
-cd apps/web && npx tsc -b --noEmit && npm run lint
+make load-test
 ```
-
-Integration tests use Testcontainers against real PostgreSQL and Kafka rather
-than mocks. The API suite starts one container for the whole assembly and gives
-each test its own database cloned from a migrated template, which keeps the
-isolation without the cost: 79 tests in about 16 seconds.
-
-## Running without Docker
-
+Or launch Locust web dashboard at `http://localhost:8089`:
 ```bash
-export ConnectionStrings__Postgres="Host=localhost;Port=5433;Database=incidentiq;Username=incidentiq;Password=<from .env>"
-export Kafka__BootstrapServers="localhost:29092"
-
-dotnet run --project services/api
-cd apps/web && npm run dev          # :5173, proxies to the services above
-cd workers/ai-analysis && .venv/bin/python -m app
+locust -f load_testing/locustfile.py --host http://localhost
 ```
 
-Readiness reports unhealthy until the variables a service actually needs are
-set, and the response names the missing one.
+---
 
-Python setup:
+## 📂 Project Structure
 
-```bash
-cd workers/ai-analysis
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
+```
+.
+├── services/
+│   ├── write_service/
+│   │   ├── app/
+│   │   │   ├── api/          # Route handlers (POST /api/v1/urls, /health, /ready)
+│   │   │   ├── core/         # Config, rate limiter, middleware
+│   │   │   ├── db/           # Async DB session lifecycle
+│   │   │   ├── models/       # Models
+│   │   │   ├── repositories/ # SQL data access & transaction management
+│   │   │   ├── schemas/      # Pydantic request/response schemas
+│   │   │   ├── services/     # Counter leasing & URL creation logic
+│   │   │   └── main.py       # FastAPI application entrypoint
+│   │   ├── tests/            # Write service unit tests
+│   │   └── Dockerfile
+│   │
+│   └── read_service/
+│       ├── app/
+│       │   ├── api/          # Route handlers (GET /{short_code}, /health, /ready)
+│       │   ├── core/         # Config, middleware
+│       │   ├── db/           # Async DB session lifecycle
+│       │   ├── repositories/ # Read repository
+│       │   ├── services/     # Cache-aside & redirect orchestration
+│       │   └── main.py       # FastAPI application entrypoint
+│       ├── tests/            # Read service unit tests
+│       └── Dockerfile
+│
+├── shared/                   # Shared libraries across services
+│   ├── config/               # Pydantic base settings
+│   ├── database/             # Declarative base & async engine
+│   ├── models/               # SQLAlchemy URL model & indexes
+│   └── utilities/            # Base62, structured logging, errors, validation
+│
+├── migrations/               # Alembic database migrations
+├── nginx/                    # Nginx API Gateway configuration
+├── scripts/                  # Seed script & background cleanup worker
+├── tests/                    # End-to-end and resilience integration tests
+├── load_testing/             # Locust load test scenarios
+├── docs/                     # System design trade-offs, failures, and interview notes
+├── docker-compose.yml
+├── .env.example
+├── Makefile
+└── README.md
 ```
 
-## Conventions
+---
 
-Configuration comes from environment variables. `.env` is git-ignored and
-`.env.example` holds placeholders, so no credential is committed.
+## 📚 In-Depth Documentation
 
-Logs are JSON in containers (Serilog, structlog) and plain text locally. Every
-line carries `service`, `version` and `environment`.
-
-Liveness never touches a dependency. Readiness touches only the dependencies
-that service actually uses, so a Kafka outage does not take the read API out of
-rotation.
-
-Warnings are errors in the .NET build. `ruff` gates Python, `tsc -b` gates the
-frontend.
-
-## Known limits
-
-Rebuild the web image after a frontend change or port 3000 keeps serving the
-previous build:
-
-```bash
-docker compose -f infrastructure/docker/docker-compose.yml up -d --build web
-```
-
-There is no login. The dashboard authenticates with a single API key held by
-nginx, so everyone who opens it shares one organization's data. `GET
-/api/v1/me` reports which organization and which user that key acts as - the
-sidebar shows it rather than asserting an identity of its own. Tenant
-isolation is enforced in the schema and in EF's query filters, but there is no
-sign-up flow in front of it.
-
-Deployments are recorded by `POST /api/v1/deployments`, or by
-`./scripts/record-deployment.sh` as the last step of a deploy job. Nothing
-calls it automatically, so a release that is not reported cannot be
-correlated - and correlation is worth more than anything else the analysis
-has. Recording one moved a test incident from 40% confidence and a symptom to
-68% and "version 3.1.0 shipped 7.2 minutes before the first occurrence".
-
-Kafka consumers have twice dropped out of their group and not rejoined.
-Readiness now catches it and names the group, but the cause is not understood.
-
-Dead letters go to `logs.failed` for the log path and `incidents.failed` for
-the incident path. Nothing replays them automatically - a dead letter is read
-by a person, because the reason it died usually matters more than the message.
-
-Several dashboard pages (Services, Deployments, Analytics, Settings, Team,
-Alert Rules) are routed but not built. They are not linked from the navigation.
+- [System Design Trade-Offs](docs/tradeoffs.md): Deep-dive into Hash vs. Counter, Redis caching, Read/Write separation, and PostgreSQL vs NoSQL.
+- [Failure Scenarios & Resilience](docs/failure-scenarios.md): Comprehensive breakdown of 10 failure modes and production recovery strategies.
+- [System Design Interview Walkthrough](docs/interview-notes.md): Structured interview preparation notes with 10x and 100x scaling roadmaps.

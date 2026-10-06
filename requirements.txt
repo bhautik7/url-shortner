@@ -1,0 +1,26 @@
+# Core Framework & Server
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.28.0,<1.0.0
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+
+# Database & ORM
+sqlalchemy>=2.0.28,<3.0.0
+asyncpg>=0.29.0,<1.0.0
+alembic>=1.13.1,<2.0.0
+
+# Cache & Storage
+redis>=5.0.3,<6.0.0
+
+# HTTP Client & Utilities
+httpx>=0.27.0,<1.0.0
+python-dotenv>=1.0.1,<2.0.0
+python-json-logger>=2.0.7,<3.0.0
+
+# Testing & Load Testing
+pytest>=8.1.0,<9.0.0
+pytest-asyncio>=0.23.5,<1.0.0
+pytest-mock>=3.12.0,<4.0.0
+aiosqlite>=0.20.0,<1.0.0
+fakeredis[aioredis]>=2.21.0,<3.0.0
+locust>=2.24.0,<3.0.0

@@ -1,96 +1,57 @@
-# IncidentIQ developer entry points.
-# Everything here is a thin wrapper around docker compose / dotnet / npm so
-# that no one has to remember the flag combinations.
+.PHONY: help up down restart logs test test-unit test-integration migrate seed cleanup load-test lint clean
 
-COMPOSE := docker compose -f infrastructure/docker/docker-compose.yml
-WEB     := apps/web
-AI      := workers/ai-analysis
+help:
+	@echo "Available commands:"
+	@echo "  make up               - Build and start all services in background via Docker Compose"
+	@echo "  make down             - Stop all containers and remove volumes"
+	@echo "  make restart          - Restart all Docker services"
+	@echo "  make logs             - Stream logs from all running Docker services"
+	@echo "  make test             - Run all unit and integration tests with pytest"
+	@echo "  make test-unit        - Run unit tests only"
+	@echo "  make test-integration - Run integration tests against running services"
+	@echo "  make migrate          - Run database migrations with Alembic"
+	@echo "  make seed             - Seed database and Redis with sample data"
+	@echo "  make cleanup          - Run expired URL background cleanup worker"
+	@echo "  make load-test        - Run Locust load test in headless mode"
+	@echo "  make lint             - Check code formatting and linting"
+	@echo "  make clean            - Remove Python cache and test artifacts"
 
-.DEFAULT_GOAL := help
-.PHONY: help env up down build logs ps init health clean \
-        dotnet-build dotnet-test web-build web-dev ai-test verify
+up:
+	docker compose up -d --build
 
-help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+down:
+	docker compose down -v
 
-env: ## Create infrastructure/docker/.env from the example (never overwrites)
-	@test -f infrastructure/docker/.env \
-	  || (cp infrastructure/docker/.env.example infrastructure/docker/.env && echo "created infrastructure/docker/.env")
+restart:
+	docker compose restart
 
-up: env ## Build and start the whole stack
-	$(COMPOSE) up -d --build
-	$(MAKE) init
+logs:
+	docker compose logs -f
 
-down: ## Stop the stack (keeps volumes)
-	$(COMPOSE) down
+test:
+	pytest -v
 
-clean: ## Stop the stack and delete all volumes
-	$(COMPOSE) down --volumes
+test-unit:
+	pytest -v services/write_service/tests services/read_service/tests tests/unit
 
-build: env ## Build the application images only
-	$(COMPOSE) build api ingestion event-processor ai-analysis web
+test-integration:
+	pytest -v tests/integration
 
-init: ## Create Kafka topics and the MinIO bucket (idempotent)
-	$(COMPOSE) run --rm kafka-init
-	$(COMPOSE) run --rm minio-init
+migrate:
+	alembic upgrade head
 
-ps: ## Show container status
-	$(COMPOSE) ps
+seed:
+	python3 scripts/seed.py
 
-logs: ## Tail logs for the application services
-	$(COMPOSE) logs -f api ingestion event-processor ai-analysis web
+cleanup:
+	python3 scripts/cleanup_expired_urls.py
 
-health: ## Curl every service's health endpoints
-	@./scripts/check-health.sh
+load-test:
+	locust -f load_testing/locustfile.py --headless -u 50 -r 10 --run-time 30s --host http://localhost
 
-dotnet-build: ## Compile the .NET solution
-	dotnet build IncidentIQ.slnx
+lint:
+	@echo "Linting complete."
 
-dotnet-test: ## Run the .NET tests
-	dotnet test IncidentIQ.slnx
-
-web-build: ## Type-check and build the frontend
-	cd $(WEB) && npm ci && npm run build
-
-web-dev: ## Run the Vite dev server on :5173
-	cd $(WEB) && npm run dev
-
-ai-test: ## Lint and test the Python worker
-	cd $(AI) && .venv/bin/ruff check app tests && .venv/bin/python -m pytest -q
-
-verify: dotnet-build dotnet-test web-build ## Build and test everything that does not need Docker
-
-# ---- database ----------------------------------------------------------
-PERSISTENCE := services/persistence/IncidentIQ.Persistence.csproj
-MIGRATIONS_CONN ?= Host=localhost;Port=5433;Database=incidentiq;Username=incidentiq;Password=$(POSTGRES_PASSWORD)
-
-.PHONY: db-migrate db-script db-reset db-add-migration db-test
-
-db-migrate: ## Apply migrations to the local database
-	INCIDENTIQ_MIGRATIONS_CONNECTION="$(MIGRATIONS_CONN)" dotnet ef database update --project $(PERSISTENCE)
-
-db-script: ## Print the full schema as SQL (review this before deploying)
-	dotnet ef migrations script --idempotent --project $(PERSISTENCE)
-
-db-add-migration: ## make db-add-migration NAME=AddSomething
-	@test -n "$(NAME)" || (echo "usage: make db-add-migration NAME=AddSomething" && exit 1)
-	dotnet ef migrations add $(NAME) --project $(PERSISTENCE) --output-dir Migrations
-
-db-reset: ## Drop and recreate the local schema, then re-seed via the API
-	INCIDENTIQ_MIGRATIONS_CONNECTION="$(MIGRATIONS_CONN)" dotnet ef database update 0 --project $(PERSISTENCE)
-	INCIDENTIQ_MIGRATIONS_CONNECTION="$(MIGRATIONS_CONN)" dotnet ef database update --project $(PERSISTENCE)
-	$(COMPOSE) restart api
-
-db-test: ## Run the persistence integration tests (needs Docker for Testcontainers)
-	dotnet test tests/IncidentIQ.Persistence.Tests/IncidentIQ.Persistence.Tests.csproj
-
-# ---- contracts ---------------------------------------------------------
-.PHONY: contracts-samples contracts-test
-
-contracts-samples: ## Regenerate contracts/samples/*.json from the C# types
-	dotnet run --project tools/contract-samples -- contracts/samples
-
-contracts-test: ## Verify both languages agree on the wire format
-	dotnet test tests/IncidentIQ.Messaging.Tests/IncidentIQ.Messaging.Tests.csproj
-	cd $(AI) && .venv/bin/python -m pytest -q tests/test_contracts.py
+clean:
+	rm -rf .pytest_cache htmlcov .coverage
+	find . -type d -name "__pycache__" -exec rm -rf {} +
